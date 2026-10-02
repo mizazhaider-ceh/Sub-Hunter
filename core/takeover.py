@@ -3,6 +3,7 @@
 Checks for subdomain takeover vulnerabilities by analyzing CNAME records
 and matching against known vulnerable service fingerprints.
 """
+import asyncio
 import aiodns
 import httpx
 from typing import List, Dict, Set
@@ -35,80 +36,92 @@ TAKEOVER_SIGNATURES = {
     "zendesk.com": ["Help Center Closed"],
 }
 
+# Concurrency caps: DNS lookups are cheap and fast, HTTP verification is not.
+DNS_CONCURRENCY = 100
+VERIFY_CONCURRENCY = 20
+
+
+def match_takeover_signature(cname_target: str) -> Dict:
+    """Match a CNAME target against known takeover fingerprints.
+
+    Returns the candidate dict, or None if no service signature matches.
+    """
+    if not cname_target:
+        return None
+    for sig, fingerprints in TAKEOVER_SIGNATURES.items():
+        if sig in cname_target:
+            return {"service": sig, "fingerprints": fingerprints}
+    return None
+
+
 async def check_takeover(domain: str, subdomains: List[str], resolver: aiodns.DNSResolver, quiet: bool = False) -> List[Dict]:
     """
     Check for subdomain takeover vulnerabilities.
-    Returns a list of vulnerable subdomains with details.
+    Returns a list of verified vulnerable subdomains with details.
     """
     results = []
-    
+
     if not quiet:
         print(f"\n{Colors.CYAN}[*] Phase 6: Checking for Subdomain Takeovers{Colors.RESET}")
-    
-    # Filter potential cnames first to avoid httpx spam if not needed
-    # (Actually we can't easily filter by DNS without resolving again, 
-    # but since main loop already resolved, maybe we could reuse `dns_results`?
-    # For now, let's just re-resolve CNAMEs for the candidates or check checks)
-    
-    # We'll batch CNAME checks
-    # Optimization: We check all alive subdomains
-    
-    tasks = []
-    # Implementation detail: 'subdomains' here assumes we want to check all of them.
-    # We'll query CNAME records.
-    
-    for sub in subdomains:
-        try:
-            # Resolving CNAME
-            # Note: A pure A record implies no CNAME, but valid takeover vectors often mean
-            # a CNAME points to a resource that was deleted.
-            result = await resolver.query(sub, 'CNAME')
-            cname_target = result.cname
-            
-            # Check signatures
-            for sig, fingerprints in TAKEOVER_SIGNATURES.items():
-                if sig in cname_target:
-                    # Potential takeover! Now verify with HTTP request
-                    # We return this candidate to be verified by a probe check
-                    results.append({
-                        "subdomain": sub,
-                        "cname": cname_target,
-                        "service": sig,
-                        "fingerprints": fingerprints
-                    })
-                    break
-                    
-        except Exception:
-            # No CNAME or resolution failed
-            continue
-            
-    # Now verify candidates with HTTP
-    # We need to make requests to see if the content matches signature
-    if results and not quiet:
-        print(f"  {Colors.YELLOW}⚠{Colors.RESET}  Found {len(results)} potential CNAME targets. Verifying...")
-        
+
+    # Phase 1: resolve CNAMEs concurrently (was sequential before, which made
+    # large scans crawl: one DNS round-trip per subdomain, one at a time).
+    dns_sem = asyncio.Semaphore(DNS_CONCURRENCY)
+
+    async def check_cname(sub: str):
+        async with dns_sem:
+            try:
+                # A pure A record implies no CNAME, but takeover vectors need a
+                # CNAME pointing at a deleted resource, so we only check CNAME.
+                result = await resolver.query(sub, 'CNAME')
+                cname_target = result.cname
+            except Exception:
+                return None  # No CNAME or resolution failed
+            match = match_takeover_signature(cname_target)
+            if match:
+                return {
+                    "subdomain": sub,
+                    "cname": cname_target,
+                    "service": match["service"],
+                    "fingerprints": match["fingerprints"],
+                }
+            return None
+
+    candidates = [c for c in
+                  await asyncio.gather(*[check_cname(s) for s in subdomains],
+                                       return_exceptions=True)
+                  if isinstance(c, dict)]
+
+    # Phase 2: verify candidates with HTTP, concurrently
+    if candidates and not quiet:
+        print(f"  {Colors.YELLOW}[!]{Colors.RESET}  Found {len(candidates)} potential CNAME targets. Verifying...")
+
     verified = []
-    
-    async with httpx.AsyncClient(verify=False, timeout=5) as client:
-        for candidate in results:
+    verify_sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
+
+    async def verify_candidate(client: httpx.AsyncClient, candidate: Dict):
+        async with verify_sem:
             try:
                 url = f"http://{candidate['subdomain']}"
                 response = await client.get(url)
                 content = response.text
-                
-                # Check fingerprints
-                is_vulnerable = False
+
                 for fp in candidate['fingerprints']:
                     if fp in content:
-                        is_vulnerable = True
-                        break
-                
-                if is_vulnerable:
-                    candidate['verified'] = True
-                    verified.append(candidate)
-                    if not quiet:
-                         print(f"  {Colors.RED}[!] VULNERABLE: {candidate['subdomain']} -> {candidate['service']}{Colors.RESET}")
+                        candidate['verified'] = True
+                        return candidate
             except Exception:
                 pass
+            return None
+
+    if candidates:
+        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+            found = await asyncio.gather(
+                *[verify_candidate(client, c) for c in candidates],
+                return_exceptions=True)
+            verified = [c for c in found if isinstance(c, dict)]
+            if not quiet:
+                for c in verified:
+                    print(f"  {Colors.RED}[!] VULNERABLE: {c['subdomain']} -> {c['service']}{Colors.RESET}")
 
     return verified
